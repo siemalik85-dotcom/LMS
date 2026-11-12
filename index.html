@@ -18,7 +18,8 @@
   <!-- Tailwind CSS 3.4.17 -->
   <script src="https://cdn.tailwindcss.com/3.4.17"></script>
   <script>
-    tailwind.config = {
+    if (typeof tailwind !== "undefined") {
+      tailwind.config = {
       theme: {
         extend: {
           fontFamily: {
@@ -39,6 +40,7 @@
         }
       }
     };
+    }
   </script>
   <style>
     /* Full-Page Blogger Override & Modern Glassmorphism Styling */
@@ -341,11 +343,11 @@
     // PASTE FIREBASE CONFIG ANDA DI SINI
     const firebaseConfig = {
       apiKey: "AIzaSyBXnqe4Y1fKShMNYfPY6i8W3U23-rnAtoo",
-  authDomain: "lms-pak-malik.firebaseapp.com",
-  projectId: "lms-pak-malik",
-  storageBucket: "lms-pak-malik.firebasestorage.app",
-  messagingSenderId: "651303012598",
-  appId: "1:651303012598:web:7dc2ae1c867a3388a084d7"
+      authDomain: "lms-pak-malik.firebaseapp.com",
+      projectId: "lms-pak-malik",
+      storageBucket: "lms-pak-malik.firebasestorage.app",
+      messagingSenderId: "651303012598",
+      appId: "1:651303012598:web:7dc2ae1c867a3388a084d7"
     };
 
     // ============================================================================
@@ -373,19 +375,106 @@
     })();
 
     // ============================================================================
-    // 3. UTILITAS STORAGE AMAN & FIREBASE CLOUD CONNECTOR
+    // 3. UTILITAS STORAGE AMAN, MIGRASI DATA LAMA, SESSION, & FIREBASE CLOUD SYNC
     // ============================================================================
     const STORAGE_KEY = 'LMS_PAK_MALIK_CLEAN_DB_V30';
+    const LEGACY_KEYS = ['EDUSMART_LMS_CBT_DB_V25', 'EDUSMART_LMS_CBT_DB', 'LMS_PAK_MALIK_DB'];
+    const SESSION_KEY = 'LMS_PAK_MALIK_ACTIVE_SESSION_V30';
+    const PENDING_SYNC_KEY = 'LMS_PAK_MALIK_PENDING_QUEUE_V30';
+    const CBT_PROGRESS_PREFIX = 'LMS_PAK_MALIK_CBT_DRAFT_';
+
     let fbApp = null;
     let fbAuth = null;
     let fbDb = null;
     let fbMod = null;
     let isCloudConnected = false;
+    let realtimeUnsubscribers = [];
+    let isOnlineStatus = navigator.onLine !== false;
 
+    // Normalisasi nama kelas agar "4A", "Kelas 4A", "kelas  4a " selalu cocok (relasi konsisten)
+    function normalizeClassKey(clsName) {
+      if (!clsName) return '';
+      return String(clsName)
+        .trim()
+        .toLowerCase()
+        .replace(/^kelas\s+/i, '')
+        .replace(/\s+/g, ' ');
+    }
+
+    function isSameClass(clsA, clsB) {
+      if (!clsA || !clsB) return false;
+      if (String(clsA).trim().toLowerCase() === 'semua kelas' || String(clsB).trim().toLowerCase() === 'semua kelas') {
+        return true;
+      }
+      return normalizeClassKey(clsA) === normalizeClassKey(clsB);
+    }
+
+    // Gabungkan array berdasarkan ID unik (mencegah duplikasi saat migrasi/sinkronisasi ulang)
+    function mergeUniqueById(primaryArr = [], secondaryArr = [], uniqueField = 'id') {
+      const map = new Map();
+      (secondaryArr || []).forEach(item => {
+        if (item && item[uniqueField]) map.set(String(item[uniqueField]), item);
+      });
+      (primaryArr || []).forEach(item => {
+        if (item && item[uniqueField]) map.set(String(item[uniqueField]), { ...(map.get(String(item[uniqueField])) || {}), ...item });
+      });
+      return Array.from(map.values());
+    }
+
+    // Indikator Status Auto-Save & Auto-Sync (Menyimpan / Tersimpan / Offline / Gagal Menyimpan)
+    function updateSaveStatusBadge(state = 'SAVED', detailText = '') {
+      const el = document.getElementById('topbar-sync-indicator');
+      if (!el) return;
+      if (state === 'SAVING') {
+        el.className = 'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200';
+        el.innerHTML = `<i class="fa-solid fa-arrows-rotate fa-spin text-amber-600"></i><span>Menyimpan${detailText ? ': ' + escapeHtml(detailText) : '...'}</span>`;
+      } else if (state === 'SAVED') {
+        el.className = 'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200';
+        el.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-500"></span><span>Tersimpan${detailText ? ' (' + escapeHtml(detailText) + ')' : ' & Sinkron'}</span>`;
+      } else if (state === 'OFFLINE') {
+        el.className = 'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold bg-orange-50 text-orange-700 border border-orange-200';
+        el.innerHTML = `<i class="fa-solid fa-wifi text-orange-500"></i><span>Offline (Antrean Aman)</span>`;
+      } else if (state === 'ERROR') {
+        el.className = 'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold bg-rose-50 text-rose-700 border border-rose-200';
+        el.innerHTML = `<i class="fa-solid fa-triangle-exclamation text-rose-600"></i><span>Gagal Menyimpan (Retry Aktif)</span>`;
+      }
+    }
+
+    // Pemulihan & Migrasi Aman dari seluruh kunci penyimpanan versi lama agar akun siswa & kelas lama TIDAK HILANG
     function safeLoadLocal() {
       try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        return raw ? JSON.parse(raw) : null;
+        let currentData = null;
+        const rawCurrent = localStorage.getItem(STORAGE_KEY);
+        if (rawCurrent) {
+          currentData = JSON.parse(rawCurrent);
+        }
+
+        // Periksa kunci lama (legacy) untuk menyelamatkan akun siswa, kelas, tugas, materi, atau nilai yang pernah dibuat
+        LEGACY_KEYS.forEach(k => {
+          try {
+            const rawOld = localStorage.getItem(k);
+            if (!rawOld) return;
+            const oldParsed = JSON.parse(rawOld);
+            if (!oldParsed || typeof oldParsed !== 'object') return;
+            if (!currentData) {
+              currentData = oldParsed;
+            } else {
+              currentData.classes = mergeUniqueById(currentData.classes, oldParsed.classes, 'id');
+              currentData.subjects = mergeUniqueById(currentData.subjects, oldParsed.subjects, 'id');
+              currentData.students = mergeUniqueById(currentData.students, oldParsed.students, 'id');
+              currentData.teachers = mergeUniqueById(currentData.teachers, oldParsed.teachers, 'id');
+              currentData.materials = mergeUniqueById(currentData.materials, oldParsed.materials, 'id');
+              currentData.assignments = mergeUniqueById(currentData.assignments, oldParsed.assignments, 'id');
+              currentData.submissions = mergeUniqueById(currentData.submissions, oldParsed.submissions, 'id');
+              currentData.examResults = mergeUniqueById(currentData.examResults, oldParsed.examResults, 'id');
+              if (oldParsed.packMeta) {
+                currentData.packMeta = { ...(oldParsed.packMeta || {}), ...(currentData.packMeta || {}) };
+              }
+            }
+          } catch (innerErr) {}
+        });
+
+        return currentData;
       } catch (e) {
         return null;
       }
@@ -398,6 +487,122 @@
         // Fallback in-memory
       }
     }
+
+    // Manajemen Session Login Persisten (Tidak Logout saat halaman di-refresh)
+    function saveActiveSession(userObj, activeMenuId) {
+      try {
+        if (!userObj) {
+          localStorage.removeItem(SESSION_KEY);
+          return;
+        }
+        localStorage.setItem(SESSION_KEY, JSON.stringify({
+          user: userObj,
+          activeMenu: activeMenuId || appState.activeMenu || '',
+          updatedAt: Date.now()
+        }));
+      } catch (e) {}
+    }
+
+    function loadActiveSession() {
+      try {
+        const raw = localStorage.getItem(SESSION_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Manajemen Antrean Sinkronisasi Offline (Offline Sync Queue + Retry)
+    function loadPendingQueue() {
+      try {
+        const raw = localStorage.getItem(PENDING_SYNC_KEY);
+        return raw ? JSON.parse(raw) : [];
+      } catch (e) {
+        return [];
+      }
+    }
+
+    function savePendingQueue(queue) {
+      try {
+        localStorage.setItem(PENDING_SYNC_KEY, JSON.stringify(queue || []));
+      } catch (e) {}
+    }
+
+    function enqueueSyncOperation(opType, collectionName, docId, payload = null) {
+      const queue = loadPendingQueue();
+      const dedupKey = `${collectionName}::${docId}`;
+      const filtered = queue.filter(item => `${item.collectionName}::${item.docId}` !== dedupKey);
+      filtered.push({
+        opType, // 'SET' | 'DELETE'
+        collectionName,
+        docId: String(docId),
+        payload,
+        timestamp: Date.now()
+      });
+      savePendingQueue(filtered);
+    }
+
+    async function flushPendingSyncQueue() {
+      if (!isCloudConnected || !fbDb || !fbMod || !navigator.onLine) return;
+      const queue = loadPendingQueue();
+      if (!queue.length) return;
+
+      updateSaveStatusBadge('SAVING', `Sinkronisasi ${queue.length} data...`);
+      const remaining = [];
+      for (const item of queue) {
+        try {
+          const docRef = fbMod.doc(fbDb, item.collectionName, String(item.docId));
+          if (item.opType === 'DELETE') {
+            await fbMod.deleteDoc(docRef);
+          } else {
+            await fbMod.setDoc(docRef, item.payload, { merge: true });
+          }
+        } catch (err) {
+          remaining.push(item);
+        }
+      }
+      savePendingQueue(remaining);
+      if (remaining.length === 0) {
+        updateSaveStatusBadge('SAVED', 'Cloud Sinkron');
+      } else {
+        updateSaveStatusBadge('ERROR');
+      }
+    }
+
+    // Listener Status Koneksi Internet (Online / Offline)
+    window.addEventListener('online', () => {
+      isOnlineStatus = true;
+      window.showToast('Koneksi internet kembali aktif. Menyinkronkan data otomatis...', 'info');
+      flushPendingSyncQueue();
+      updateSaveStatusBadge('SAVED');
+    });
+
+    window.addEventListener('offline', () => {
+      isOnlineStatus = false;
+      window.showToast('Koneksi internet terputus. Perubahan disimpan aman di antrean lokal & akan disinkronkan saat online.', 'warning');
+      updateSaveStatusBadge('OFFLINE');
+    });
+
+    // Sinkronisasi Real-Time Antar-Tab Perangkat
+    window.addEventListener('storage', (evt) => {
+      if (evt.key === STORAGE_KEY && evt.newValue) {
+        try {
+          const updatedDb = JSON.parse(evt.newValue);
+          if (updatedDb) {
+            appState.db = updatedDb;
+            refreshBrandingUI();
+            if (appState.currentUser) {
+              // Segarkan data user aktif jika siswa diubah kelas/namanya oleh Admin
+              if (appState.currentUser.role === 'student') {
+                const freshStd = (appState.db.students || []).find(s => s.id === appState.currentUser.id);
+                if (freshStd) appState.currentUser = { ...freshStd, role: 'student' };
+              }
+              renderActivePage();
+            }
+          }
+        } catch (e) {}
+      }
+    });
 
     async function initFirebaseIfReady() {
       if (IS_PREVIEW || !firebaseConfig.apiKey || firebaseConfig.apiKey === 'API_KEY_ANDA') {
@@ -1201,63 +1406,220 @@
       };
     }
 
+    async function pullAllCollectionsFromCloud() {
+      if (!isCloudConnected || !fbDb || !fbMod) return;
+      try {
+        updateSaveStatusBadge('SAVING', 'Memuat Cloud...');
+        // 1. Settings
+        const settingsRef = fbMod.doc(fbDb, 'settings', 'school_profile');
+        const settingsSnap = await fbMod.getDoc(settingsRef);
+        if (settingsSnap.exists()) {
+          appState.db.settings = { ...appState.db.settings, ...settingsSnap.data() };
+        } else {
+          await fbMod.setDoc(settingsRef, appState.db.settings, { merge: true });
+        }
+
+        // 2. Helper untuk tarik koleksi penuh dari Firestore & merge tanpa menghapus data lokal yang belum terkirim
+        const collectionsMap = [
+          { col: 'classes', key: 'classes' },
+          { col: 'subjects', key: 'subjects' },
+          { col: 'students', key: 'students' },
+          { col: 'teachers', key: 'teachers' },
+          { col: 'materials', key: 'materials' },
+          { col: 'assignments', key: 'assignments' },
+          { col: 'submissions', key: 'submissions' },
+          { col: 'exam_results', key: 'examResults' }
+        ];
+
+        for (const item of collectionsMap) {
+          const snap = await fbMod.getDocs(fbMod.collection(fbDb, item.col));
+          const cloudDocs = [];
+          snap.forEach(d => cloudDocs.push(d.data()));
+          if (cloudDocs.length > 0) {
+            appState.db[item.key] = mergeUniqueById(cloudDocs, appState.db[item.key] || [], 'id');
+          } else if ((appState.db[item.key] || []).length > 0) {
+            for (const localDoc of appState.db[item.key]) {
+              if (localDoc && localDoc.id) {
+                await fbMod.setDoc(fbMod.doc(fbDb, item.col, String(localDoc.id)), localDoc, { merge: true });
+              }
+            }
+          }
+        }
+
+        // 3. Tarik metadata paket soal & butir soal custom dari `question_packs`
+        const qpSnap = await fbMod.getDocs(fbMod.collection(fbDb, 'question_packs'));
+        qpSnap.forEach(d => {
+          const data = d.data();
+          const pKey = data.packKey || d.id;
+          if (data.meta) {
+            if (!appState.db.packMeta) appState.db.packMeta = {};
+            appState.db.packMeta[pKey] = data.meta;
+          }
+          if (Array.isArray(data.questions) && data.questions.length > 0) {
+            appState.db.questionPacks[pKey] = data.questions;
+          }
+        });
+
+        safeSaveLocal(appState.db);
+        updateSaveStatusBadge('SAVED', 'Cloud Aktif');
+      } catch (err) {
+        console.warn('Pull koleksi Cloud:', err);
+        updateSaveStatusBadge(navigator.onLine ? 'SAVED' : 'OFFLINE');
+      }
+    }
+
+    function startRealtimeCloudSubscriptions() {
+      if (!isCloudConnected || !fbDb || !fbMod || typeof fbMod.onSnapshot !== 'function') return;
+      realtimeUnsubscribers.forEach(unsub => { try { unsub(); } catch (e) {} });
+      realtimeUnsubscribers = [];
+
+      const watchList = [
+        { col: 'classes', key: 'classes' },
+        { col: 'subjects', key: 'subjects' },
+        { col: 'students', key: 'students' },
+        { col: 'teachers', key: 'teachers' },
+        { col: 'materials', key: 'materials' },
+        { col: 'assignments', key: 'assignments' },
+        { col: 'submissions', key: 'submissions' },
+        { col: 'exam_results', key: 'examResults' }
+      ];
+
+      watchList.forEach(({ col, key }) => {
+        try {
+          const unsub = fbMod.onSnapshot(fbMod.collection(fbDb, col), (snapshot) => {
+            const list = [];
+            snapshot.forEach(docSnap => list.push(docSnap.data()));
+            appState.db[key] = list;
+            safeSaveLocal(appState.db);
+            if (appState.currentUser) {
+              if (appState.currentUser.role === 'student' && key === 'students') {
+                const me = list.find(s => s.id === appState.currentUser.id);
+                if (me) {
+                  appState.currentUser = { ...me, role: 'student' };
+                  saveActiveSession(appState.currentUser, appState.activeMenu);
+                }
+              }
+              renderActivePage();
+            }
+          });
+          realtimeUnsubscribers.push(unsub);
+        } catch (e) {}
+      });
+    }
+
     async function autoSetupDatabase() {
       await initFirebaseIfReady();
       let existing = safeLoadLocal();
+      const baseTemplate = createInitialDummyDatabase();
 
-      if (!existing || !existing.questionPacks || Object.keys(existing.questionPacks).length < 27) {
-        const fresh = createInitialDummyDatabase();
-        if (existing) {
-          // Pertahankan perubahan user jika ada, lengkapi 27 paket soal
-          fresh.settings = existing.settings || fresh.settings;
-          fresh.classes = existing.classes || fresh.classes;
-          fresh.students = existing.students || fresh.students;
-          fresh.assignments = existing.assignments || fresh.assignments;
-          fresh.submissions = existing.submissions || fresh.submissions;
-          fresh.examResults = existing.examResults || fresh.examResults;
+      if (!existing) {
+        existing = baseTemplate;
+      } else {
+        // Pastikan seluruh properti tabel dan relasi tersedia tanpa merusak data lama
+        existing.settings = { ...baseTemplate.settings, ...(existing.settings || {}) };
+        existing.classes = Array.isArray(existing.classes) ? existing.classes : [];
+        existing.subjects = Array.isArray(existing.subjects) && existing.subjects.length > 0 ? existing.subjects : baseTemplate.subjects;
+        existing.students = Array.isArray(existing.students) ? existing.students : [];
+        existing.teachers = Array.isArray(existing.teachers) ? existing.teachers : [];
+        existing.materials = Array.isArray(existing.materials) ? existing.materials : [];
+        existing.assignments = Array.isArray(existing.assignments) ? existing.assignments : [];
+        existing.submissions = Array.isArray(existing.submissions) ? existing.submissions : [];
+        existing.examResults = Array.isArray(existing.examResults) ? existing.examResults : [];
+        existing.packMeta = existing.packMeta || {};
+        if (!existing.questionPacks || Object.keys(existing.questionPacks).length < 27) {
+          existing.questionPacks = { ...baseTemplate.questionPacks, ...(existing.questionPacks || {}) };
         }
-        safeSaveLocal(fresh);
-        existing = fresh;
       }
 
-      appState.db = existing;
-
-      // Jika terhubung ke Firebase Cloud, sinkronkan dokumen awal bila koleksi kosong
-      if (isCloudConnected && fbDb && fbMod) {
-        try {
-          const settingsRef = fbMod.doc(fbDb, 'settings', 'school_profile');
-          const snap = await fbMod.getDoc(settingsRef);
-          if (!snap.exists()) {
-            await fbMod.setDoc(settingsRef, appState.db.settings);
-            for (const cls of appState.db.classes) {
-              await fbMod.setDoc(fbMod.doc(fbDb, 'classes', cls.id), cls);
-            }
-            for (const std of appState.db.students) {
-              await fbMod.setDoc(fbMod.doc(fbDb, 'students', std.id), std);
-            }
-            for (const asg of appState.db.assignments) {
-              await fbMod.setDoc(fbMod.doc(fbDb, 'assignments', asg.id), asg);
-            }
-          } else {
-            appState.db.settings = { ...appState.db.settings, ...snap.data() };
-            safeSaveLocal(appState.db);
-          }
-        } catch (cloudErr) {
-          console.warn('AutoSetup Cloud fallback ke local storage:', cloudErr);
+      // Pastikan setiap kelas yang dirujuk pada akun siswa terdaftar di tabel `classes` (Integritas Foreign Key)
+      const knownClassNames = new Set((existing.classes || []).map(c => normalizeClassKey(c.className)));
+      (existing.students || []).forEach(std => {
+        if (std && std.className && !knownClassNames.has(normalizeClassKey(std.className))) {
+          knownClassNames.add(normalizeClassKey(std.className));
+          existing.classes.push({
+            id: 'CLS-AUTO-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
+            className: std.className.trim(),
+            homeroomTeacher: 'Guru Kelas',
+            studentCountNote: 'Terhubung Otomatis'
+          });
         }
+      });
+
+      appState.db = existing;
+      safeSaveLocal(appState.db);
+
+      if (isCloudConnected) {
+        await flushPendingSyncQueue();
+        await pullAllCollectionsFromCloud();
+        startRealtimeCloudSubscriptions();
+      } else {
+        updateSaveStatusBadge(navigator.onLine ? 'SAVED' : 'OFFLINE', 'Penyimpanan Otomatis Aktif');
       }
 
       refreshBrandingUI();
+
+      // Pulihkan Session Pengguna jika belum Logout (Tahan Refresh Halaman)
+      const savedSession = loadActiveSession();
+      if (savedSession && savedSession.user) {
+        const u = savedSession.user;
+        if (u.role === 'student') {
+          const matchedStd = (appState.db.students || []).find(
+            s => s.id === u.id || s.username.toLowerCase() === String(u.username || '').toLowerCase()
+          );
+          if (matchedStd) {
+            appState.currentUser = { ...matchedStd, role: 'student' };
+            enterMainApp(savedSession.activeMenu || 'siswa_beranda');
+          } else {
+            saveActiveSession(null);
+          }
+        } else if (u.role === 'admin' || u.role === 'teacher') {
+          appState.currentUser = u;
+          enterMainApp(savedSession.activeMenu || 'admin_kelas_mapel');
+        }
+      }
     }
 
-    async function persistDatabase(collectionHint = null, docId = null, payload = null) {
+    async function persistDatabase(collectionHint = null, docId = null, payload = null, opType = 'SET') {
+      updateSaveStatusBadge('SAVING');
       safeSaveLocal(appState.db);
-      if (isCloudConnected && fbDb && fbMod && collectionHint && docId && payload) {
-        try {
-          await fbMod.setDoc(fbMod.doc(fbDb, collectionHint, docId), payload, { merge: true });
-        } catch (e) {
-          console.warn('Sinkronisasi cloud tertunda:', e);
+
+      if (!collectionHint || !docId) {
+        setTimeout(() => updateSaveStatusBadge(navigator.onLine ? 'SAVED' : 'OFFLINE'), 180);
+        return;
+      }
+
+      if (!navigator.onLine) {
+        enqueueSyncOperation(opType, collectionHint, docId, payload);
+        updateSaveStatusBadge('OFFLINE');
+        return;
+      }
+
+      if (isCloudConnected && fbDb && fbMod) {
+        let attempts = 0;
+        const maxAttempts = 3;
+        while (attempts < maxAttempts) {
+          try {
+            const docRef = fbMod.doc(fbDb, collectionHint, String(docId));
+            if (opType === 'DELETE') {
+              await fbMod.deleteDoc(docRef);
+            } else if (payload) {
+              await fbMod.setDoc(docRef, payload, { merge: true });
+            }
+            updateSaveStatusBadge('SAVED', 'Cloud & Lokal');
+            return;
+          } catch (e) {
+            attempts += 1;
+            if (attempts >= maxAttempts) {
+              console.warn('Sinkronisasi cloud gagal setelah retry, masuk ke antrean aman:', e);
+              enqueueSyncOperation(opType, collectionHint, docId, payload);
+              updateSaveStatusBadge('ERROR');
+            } else {
+              await new Promise(r => setTimeout(r, 400 * attempts));
+            }
+          }
         }
+      } else {
+        setTimeout(() => updateSaveStatusBadge('SAVED'), 150);
       }
     }
 
@@ -1558,57 +1920,132 @@
 
     window.handleAdminLogin = async function(e) {
       e.preventDefault();
-      const email = document.getElementById('admin-login-email').value.trim();
-      const password = document.getElementById('admin-login-password').value;
+      const email = String(document.getElementById('admin-login-email').value || '').trim();
+      const password = String(document.getElementById('admin-login-password').value || '').trim();
 
+      if (isCloudConnected) {
+        await pullAllCollectionsFromCloud();
+      }
+
+      // 1. Cek jika login menggunakan akun Guru terdaftar di tabel teachers
+      const matchedTeacher = (appState.db.teachers || []).find(
+        t => (String(t.email || '').trim().toLowerCase() === email.toLowerCase() ||
+              String(t.username || '').trim().toLowerCase() === email.toLowerCase()) &&
+             String(t.password || '').trim() === password
+      );
+      if (matchedTeacher) {
+        appState.currentUser = {
+          role: 'teacher',
+          id: matchedTeacher.id,
+          email: matchedTeacher.email || matchedTeacher.username,
+          name: matchedTeacher.fullName,
+          assignedClass: matchedTeacher.assignedClass || 'Semua Kelas'
+        };
+        saveActiveSession(appState.currentUser, 'admin_kelas_mapel');
+        enterMainApp('admin_kelas_mapel');
+        window.showToast(`Selamat datang Bapak/Ibu Guru ${matchedTeacher.fullName}!`, 'success');
+        return;
+      }
+
+      // 2. Cek jika login via Firebase Auth untuk Administrator
       if (isCloudConnected && fbAuth && fbMod) {
         try {
           await fbMod.signInWithEmailAndPassword(fbAuth, email, password);
           appState.currentUser = {
             role: 'admin',
             email,
-            name: 'Administrator / Guru'
+            name: 'Administrator LMS'
           };
+          saveActiveSession(appState.currentUser, 'admin_kelas_mapel');
           enterMainApp('admin_kelas_mapel');
-          window.showToast('Berhasil masuk sebagai Admin via Firebase Auth!', 'success');
+          window.showToast('Berhasil masuk sebagai Administrator via Firebase Auth!', 'success');
           return;
         } catch (err) {
-          // Fallback ke validasi pengaturan lokal bila di preview
+          // Lanjut ke pemeriksaan kredensial pengaturan
         }
       }
 
-      const validEmail = (appState.db.settings.adminEmail || 'admin@sekolah.sch.id').toLowerCase();
-      const validPass = appState.db.settings.adminPassword || 'admin123';
+      // 3. Validasi terhadap kredensial Administrator di pengaturan sistem
+      const validEmail = String(appState.db.settings.adminEmail || 'admin@sekolah.sch.id').trim().toLowerCase();
+      const validPass = String(appState.db.settings.adminPassword || 'admin123').trim();
       if (email.toLowerCase() === validEmail && password === validPass) {
         appState.currentUser = {
           role: 'admin',
           email,
-          name: 'Administrator / Guru'
+          name: 'Administrator LMS'
         };
+        saveActiveSession(appState.currentUser, 'admin_kelas_mapel');
         enterMainApp('admin_kelas_mapel');
-        window.showToast('Selamat datang di Panel Admin LMS!', 'success');
+        window.showToast('Selamat datang di Panel Administrator LMS!', 'success');
       } else {
-        window.showToast('Email atau Password Admin tidak sesuai!', 'error');
+        window.showToast('Email/Username atau Password Admin/Guru tidak sesuai!', 'error');
       }
     };
 
     window.handleStudentLogin = async function(e) {
       e.preventDefault();
-      const username = document.getElementById('student-login-username').value.trim().toLowerCase();
-      const password = document.getElementById('student-login-password').value;
+      const rawInput = String(document.getElementById('student-login-username').value || '').trim();
+      const loginKey = rawInput.toLowerCase();
+      const password = String(document.getElementById('student-login-password').value || '').trim();
 
-      const found = appState.db.students.find(
-        s => (s.username.toLowerCase() === username || (s.nisn && s.nisn === username)) && s.password === password
-      );
-
-      if (!found) {
-        window.showToast('Username/NISN atau Password Siswa salah! Silakan cek kembali.', 'error');
+      if (!loginKey || !password) {
+        window.showToast('Harap isi Username/NISN dan Password Siswa.', 'warning');
         return;
       }
 
+      // Tarik pembaruan dari Cloud jika terhubung agar akun siswa yang baru dibuat di perangkat lain langsung ditemukan
+      if (isCloudConnected) {
+        await pullAllCollectionsFromCloud();
+      }
+
+      const matchStudentFn = (s) => {
+        if (!s) return false;
+        const uName = String(s.username || '').trim().toLowerCase();
+        const uNisn = String(s.nisn || '').trim().toLowerCase();
+        const uFull = String(s.fullName || '').trim().toLowerCase();
+        const uPass = String(s.password || '').trim();
+        return (uName === loginKey || (uNisn && uNisn === loginKey) || uFull === loginKey) && uPass === password;
+      };
+
+      let found = (appState.db.students || []).find(matchStudentFn);
+
+      // Jika belum ketemu, cek ulang di localStorage siapa tahu baru ditambahkan di tab lain
+      if (!found) {
+        const freshLocal = safeLoadLocal();
+        if (freshLocal && Array.isArray(freshLocal.students)) {
+          appState.db.students = mergeUniqueById(freshLocal.students, appState.db.students, 'id');
+          found = appState.db.students.find(matchStudentFn);
+        }
+      }
+
+      if (!found) {
+        const totalRegistered = (appState.db.students || []).length;
+        if (totalRegistered === 0) {
+          window.showToast('Belum ada akun siswa terdaftar. Silakan masuk sebagai Admin/Guru di menu Data Siswa untuk mendaftarkan akun siswa terlebih dahulu.', 'warning');
+        } else {
+          window.showToast('Username/NISN atau Password Siswa tidak cocok! Pastikan sesuai dengan yang didaftarkan di menu Data Siswa.', 'error');
+        }
+        return;
+      }
+
+      // Pastikan kelas siswa tersebut juga tercatat di daftar kelas agar relasi kelas selalu valid
+      if (found.className) {
+        const hasClass = (appState.db.classes || []).some(c => isSameClass(c.className, found.className));
+        if (!hasClass) {
+          const autoCls = {
+            id: 'CLS-' + Date.now(),
+            className: found.className.trim(),
+            homeroomTeacher: 'Wali Kelas',
+            studentCountNote: 'Aktif'
+          };
+          appState.db.classes.push(autoCls);
+          persistDatabase('classes', autoCls.id, autoCls);
+        }
+      }
+
       appState.currentUser = {
-        role: 'student',
-        ...found
+        ...found,
+        role: 'student'
       };
       appState.studentCbtSession = {
         step: 'SELECT_SUBJECT',
@@ -1618,8 +2055,9 @@
         answers: {},
         lastResult: null
       };
+      saveActiveSession(appState.currentUser, 'siswa_beranda');
       enterMainApp('siswa_beranda');
-      window.showToast(`Halo ${found.fullName}, selamat belajar!`, 'success');
+      window.showToast(`Login berhasil! Selamat datang ${found.fullName} (${found.className}).`, 'success');
     };
 
     window.handleLogout = async function() {
@@ -1627,6 +2065,7 @@
         try { await fbMod.signOut(fbAuth); } catch (e) {}
       }
       appState.currentUser = null;
+      saveActiveSession(null);
       document.getElementById('view-main-app').classList.add('hidden');
       document.getElementById('view-login').classList.remove('hidden');
       window.showToast('Anda telah keluar dari sesi aplikasi.', 'info');
@@ -1636,41 +2075,66 @@
     // 8. KONFIGURASI NAVIGASI MENU ADMIN (7 MENU) & SISWA (6 MENU)
     // ============================================================================
     const ADMIN_MENUS = [
-      { id: 'admin_kelas_mapel', label: 'Kelola Kelas & Mapel', shortLabel: 'Kelas/Mapel', icon: 'fa-chalkboard-user' },
-      { id: 'admin_siswa', label: 'Data Siswa', shortLabel: 'Siswa', icon: 'fa-users' },
+      { id: 'admin_kelas_mapel', label: 'Kelola Kelas, Mapel & Materi', shortLabel: 'Kelas/Mapel', icon: 'fa-chalkboard-user' },
+      { id: 'admin_siswa', label: 'Data Siswa & Guru', shortLabel: 'Siswa/Guru', icon: 'fa-users' },
       { id: 'admin_tugas', label: 'Kelola Tugas', shortLabel: 'Tugas', icon: 'fa-list-check' },
       { id: 'admin_cbt', label: 'Latihan Soal Semester 1', shortLabel: 'Bank Soal', icon: 'fa-file-signature' },
-      { id: 'admin_penilaian', label: 'Pengumpulan & Penilaian', shortLabel: 'Penilaian', icon: 'fa-Clipboard-check' },
+      { id: 'admin_penilaian', label: 'Pengumpulan & Penilaian', shortLabel: 'Penilaian', icon: 'fa-clipboard-check' },
       { id: 'admin_rekap', label: 'Rekap Nilai', shortLabel: 'Rekap', icon: 'fa-chart-column' },
       { id: 'admin_pengaturan', label: 'Pengaturan', shortLabel: 'Pengaturan', icon: 'fa-sliders' }
     ];
 
     const STUDENT_MENUS = [
-      { id: 'siswa_beranda', label: 'Beranda', shortLabel: 'Beranda', icon: 'fa-house' },
+      { id: 'siswa_beranda', label: 'Beranda & Kelas Saya', shortLabel: 'Beranda', icon: 'fa-house' },
+      { id: 'siswa_kelas_materi', label: 'Ruang Kelas & Materi', shortLabel: 'Kelas/Materi', icon: 'fa-chalkboard' },
       { id: 'siswa_biodata', label: 'Biodata', shortLabel: 'Biodata', icon: 'fa-id-badge' },
       { id: 'siswa_cbt', label: 'Latihan Soal Semester 1', shortLabel: 'Latihan Soal', icon: 'fa-laptop-file' },
       { id: 'siswa_daftar_tugas', label: 'Daftar Tugas', shortLabel: 'Tugas', icon: 'fa-book-bookmark' },
       { id: 'siswa_kumpul_tugas', label: 'Kumpulkan Tugas', shortLabel: 'Kumpulkan', icon: 'fa-cloud-arrow-up' },
-      { id: 'siswa_nilai', label: 'Nilai', shortLabel: 'Nilai', icon: 'fa-award' }
+      { id: 'siswa_nilai', label: 'Nilai & Progres', shortLabel: 'Nilai', icon: 'fa-award' }
     ];
+
+    function getMenusForCurrentRole() {
+      if (!appState.currentUser) return STUDENT_MENUS;
+      if (appState.currentUser.role === 'admin') return ADMIN_MENUS;
+      if (appState.currentUser.role === 'teacher') {
+        // Guru dapat mengakses pengelolaan kelas, siswa, tugas, bank soal, penilaian, dan rekap nilai
+        return ADMIN_MENUS.filter(m => m.id !== 'admin_pengaturan');
+      }
+      return STUDENT_MENUS;
+    }
 
     function enterMainApp(defaultMenuId) {
       document.getElementById('view-login').classList.add('hidden');
       document.getElementById('view-main-app').classList.remove('hidden');
 
-      const isStudent = appState.currentUser.role === 'student';
-      document.getElementById('sidebar-role-badge').textContent = isStudent ? `Siswa • ${appState.currentUser.className}` : 'Panel Admin / Guru';
+      const role = appState.currentUser.role;
+      const isStudent = role === 'student';
+      const roleLabel = isStudent
+        ? `Siswa • ${appState.currentUser.className}`
+        : role === 'teacher'
+        ? `Guru • ${appState.currentUser.assignedClass || 'Pengajar'}`
+        : 'Administrator LMS';
+
+      document.getElementById('sidebar-role-badge').textContent = roleLabel;
       document.getElementById('sidebar-user-name').textContent = isStudent ? appState.currentUser.fullName : appState.currentUser.name;
       document.getElementById('sidebar-user-sub').textContent = isStudent ? `NISN/User: ${appState.currentUser.username}` : appState.currentUser.email;
-      document.getElementById('sidebar-user-avatar').textContent = (isStudent ? appState.currentUser.fullName : 'Admin').charAt(0).toUpperCase();
+      document.getElementById('sidebar-user-avatar').textContent = (isStudent ? appState.currentUser.fullName : (appState.currentUser.name || 'A')).charAt(0).toUpperCase();
+
+      const syncBadge = document.getElementById('topbar-sync-indicator');
+      if (syncBadge) syncBadge.classList.remove('hidden');
 
       window.navigateToMenu(defaultMenuId);
     }
 
     window.navigateToMenu = function(menuId) {
-      appState.activeMenu = menuId;
-      const menus = appState.currentUser.role === 'admin' ? ADMIN_MENUS : STUDENT_MENUS;
-      const currentMenuObj = menus.find(m => m.id === menuId) || menus[0];
+      if (!appState.currentUser) return;
+      const menus = getMenusForCurrentRole();
+      // Proteksi Hak Akses (Role-Based Access Control): pastikan siswa tidak bisa memanggil menu admin dan sebaliknya
+      const allowedMenu = menus.find(m => m.id === menuId) || menus[0];
+      appState.activeMenu = allowedMenu.id;
+      saveActiveSession(appState.currentUser, appState.activeMenu);
+      const currentMenuObj = allowedMenu;
 
       document.getElementById('topbar-page-title').textContent = currentMenuObj.label;
 
@@ -1741,6 +2205,9 @@
         case 'siswa_beranda':
           renderSiswaBeranda(container);
           break;
+        case 'siswa_kelas_materi':
+          renderSiswaKelasMateri(container);
+          break;
         case 'siswa_biodata':
           renderSiswaBiodata(container);
           break;
@@ -1757,7 +2224,11 @@
           renderSiswaNilai(container);
           break;
         default:
-          renderAdminKelasMapel(container);
+          if (appState.currentUser && appState.currentUser.role === 'student') {
+            renderSiswaBeranda(container);
+          } else {
+            renderAdminKelasMapel(container);
+          }
       }
     }
 
@@ -1842,7 +2313,7 @@
               <h3 class="text-base font-extrabold text-slate-900 mb-3">Daftar Kelas Aktif (${classes.length})</h3>
               <div class="space-y-2.5">
                 ${classes.map(cls => {
-                  const countStd = students.filter(s => s.className === cls.className).length;
+                  const countStd = students.filter(s => isSameClass(s.className, cls.className)).length;
                   return `
                     <div class="flex items-center justify-between p-3.5 rounded-xl bg-slate-50 border border-slate-200/80">
                       <div>
@@ -1912,6 +2383,65 @@
                 `).join('')}
               </div>
             </div>
+
+            <!-- Panel Unggah Materi & Video Pembelajaran Kelas -->
+            <div class="bento-card p-6">
+              <h3 class="text-base font-extrabold text-slate-900 flex items-center gap-2 mb-1">
+                <i class="fa-solid fa-book-open-reader text-emerald-600"></i>
+                <span>Unggah Materi & Video Pembelajaran Kelas</span>
+              </h3>
+              <p class="text-xs text-slate-500 mb-4">Materi yang ditambahkan otomatis muncul pada Ruang Kelas & Materi milik siswa di kelas terkait.</p>
+              <form onsubmit="window.handleAddMaterial(event)" class="space-y-3">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <div class="md:col-span-2">
+                    <label class="block text-xs font-bold text-slate-600 mb-1">Judul Materi / Bab Pembelajaran</label>
+                    <input type="text" id="mat-title" required placeholder="Contoh: Bab 1 - Sejarah & Lambang Garuda Pancasila" class="w-full px-3.5 py-2 rounded-xl border border-slate-300 text-xs outline-none focus:border-indigo-600" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-bold text-slate-600 mb-1">Target Kelas</label>
+                    <select id="mat-class" required class="w-full px-3 py-2 rounded-xl border border-slate-300 text-xs bg-white outline-none focus:border-indigo-600">
+                      <option value="Semua Kelas">Semua Kelas</option>
+                      ${classes.map(c => `<option value="${escapeHtml(c.className)}">${escapeHtml(c.className)}</option>`).join('')}
+                    </select>
+                  </div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div>
+                    <label class="block text-xs font-bold text-slate-600 mb-1">Mata Pelajaran</label>
+                    <input type="text" id="mat-subject" required placeholder="Contoh: Pendidikan Pancasila / Matematika" class="w-full px-3.5 py-2 rounded-xl border border-slate-300 text-xs outline-none focus:border-indigo-600" />
+                  </div>
+                  <div>
+                    <label class="block text-xs font-bold text-slate-600 mb-1">Tautan Video / Dokumen / Modul (Opsional)</label>
+                    <input type="url" id="mat-url" placeholder="https://youtube.com/... atau https://drive.google.com/..." class="w-full px-3.5 py-2 rounded-xl border border-slate-300 text-xs outline-none focus:border-indigo-600" />
+                  </div>
+                </div>
+                <div>
+                  <label class="block text-xs font-bold text-slate-600 mb-1">Ringkasan Materi / Isi Bacaan</label>
+                  <textarea id="mat-summary" rows="2" required placeholder="Tuliskan rangkuman materi pembelajaran yang dapat dibaca langsung oleh siswa..." class="w-full px-3.5 py-2 rounded-xl border border-slate-300 text-xs outline-none focus:border-indigo-600"></textarea>
+                </div>
+                <button type="submit" class="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-sm transition">
+                  <i class="fa-solid fa-cloud-arrow-up mr-1"></i> Terbitkan Materi ke Kelas
+                </button>
+              </form>
+
+              ${(appState.db.materials || []).length > 0 ? `
+                <div class="mt-4 pt-4 border-t border-slate-100 space-y-2">
+                  <p class="text-xs font-bold text-slate-700">Materi Terbit (${(appState.db.materials || []).length}):</p>
+                  ${(appState.db.materials || []).map(mat => `
+                    <div class="p-3 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-between gap-2 text-xs">
+                      <div class="min-w-0">
+                        <span class="px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 font-bold text-[10px] mr-1">${escapeHtml(mat.className)}</span>
+                        <span class="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 font-bold text-[10px] mr-1">${escapeHtml(mat.subjectName)}</span>
+                        <strong class="text-slate-900">${escapeHtml(mat.title)}</strong>
+                      </div>
+                      <button type="button" onclick="window.handleDeleteMaterial('${mat.id}')" class="text-rose-600 hover:bg-rose-50 p-1.5 rounded-lg shrink-0">
+                        <i class="fa-solid fa-trash"></i>
+                      </button>
+                    </div>
+                  `).join('')}
+                </div>
+              ` : ''}
+            </div>
           </div>
         </div>
       `;
@@ -1937,9 +2467,9 @@
     };
 
     window.handleDeleteClass = function(classId) {
-      appState.db.classes = appState.db.classes.filter(c => c.id !== classId);
-      persistDatabase();
-      window.showToast('Data kelas berhasil dihapus.', 'info');
+      appState.db.classes = (appState.db.classes || []).filter(c => c.id !== classId);
+      persistDatabase('classes', classId, null, 'DELETE');
+      window.showToast('Data kelas berhasil dihapus & disinkronkan.', 'info');
       renderActivePage();
     };
 
@@ -1967,9 +2497,42 @@
     };
 
     window.handleDeleteSubject = function(subId) {
-      appState.db.subjects = appState.db.subjects.filter(s => s.id !== subId);
-      persistDatabase();
-      window.showToast('Mata pelajaran berhasil dihapus.', 'info');
+      appState.db.subjects = (appState.db.subjects || []).filter(s => s.id !== subId);
+      persistDatabase('subjects', subId, null, 'DELETE');
+      window.showToast('Mata pelajaran berhasil dihapus & disinkronkan.', 'info');
+      renderActivePage();
+    };
+
+    window.handleAddMaterial = function(e) {
+      e.preventDefault();
+      const title = document.getElementById('mat-title').value.trim();
+      const subjectName = document.getElementById('mat-subject').value.trim();
+      const className = document.getElementById('mat-class').value;
+      const summary = document.getElementById('mat-summary').value.trim();
+      const mediaUrl = document.getElementById('mat-url').value.trim();
+      if (!title || !subjectName) return;
+
+      if (!Array.isArray(appState.db.materials)) appState.db.materials = [];
+      const newMat = {
+        id: 'MAT-' + Date.now(),
+        title,
+        subjectName,
+        className,
+        summary,
+        mediaUrl,
+        authorName: (appState.currentUser && appState.currentUser.name) || 'Admin / Guru',
+        createdAt: new Date().toISOString().slice(0, 10)
+      };
+      appState.db.materials.unshift(newMat);
+      persistDatabase('materials', newMat.id, newMat, 'SET');
+      window.showToast(`Materi "${title}" untuk ${className} berhasil diterbitkan!`, 'success');
+      renderActivePage();
+    };
+
+    window.handleDeleteMaterial = function(matId) {
+      appState.db.materials = (appState.db.materials || []).filter(m => m.id !== matId);
+      persistDatabase('materials', matId, null, 'DELETE');
+      window.showToast('Materi pembelajaran dihapus.', 'info');
       renderActivePage();
     };
 
@@ -2010,13 +2573,14 @@
                     <input type="text" id="std-password" value="123456" required class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm font-mono outline-none focus:border-indigo-600" />
                   </div>
                   <div>
-                    <label class="block text-xs font-bold text-slate-600 mb-1">Pilih Kelas</label>
-                    <select id="std-class" required class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm bg-white outline-none focus:border-indigo-600">
-                      ${classes.length > 0
-                        ? classes.map(c => `<option value="${escapeHtml(c.className)}">${escapeHtml(c.className)}</option>`).join('')
-                        : `<option value="Kelas Umum">Belum ada kelas (Tambahkan di menu Kelola Kelas)</option>`
-                      }
-                    </select>
+                    <label class="block text-xs font-bold text-slate-600 mb-1">Kelas Siswa</label>
+                    ${classes.length > 0 ? `
+                      <select id="std-class" required class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm bg-white outline-none focus:border-indigo-600">
+                        ${classes.map(c => `<option value="${escapeHtml(c.className)}">${escapeHtml(c.className)}</option>`).join('')}
+                      </select>
+                    ` : `
+                      <input type="text" id="std-class" required placeholder="Ketik nama kelas (misal: Kelas 4A)" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm outline-none focus:border-indigo-600" />
+                    `}
                   </div>
                 </div>
                 <div class="grid grid-cols-2 gap-3">
@@ -2115,21 +2679,34 @@
         return;
       }
 
+      const cleanClassName = (className || 'Kelas 4A').trim();
+      // Pastikan kelas otomatis terdaftar di tabel classes jika belum ada
+      if (!(appState.db.classes || []).some(c => isSameClass(c.className, cleanClassName))) {
+        const autoCls = {
+          id: 'CLS-' + Date.now(),
+          className: cleanClassName,
+          homeroomTeacher: 'Wali Kelas',
+          studentCountNote: 'Reguler'
+        };
+        appState.db.classes.push(autoCls);
+        persistDatabase('classes', autoCls.id, autoCls, 'SET');
+      }
+
       const newStd = {
         id: 'STD-' + Date.now(),
         fullName,
         username,
         nisn,
         password,
-        className,
+        className: cleanClassName,
         gender,
         birthPlaceDate,
         address,
         phone: '-'
       };
       appState.db.students.push(newStd);
-      persistDatabase('students', newStd.id, newStd);
-      window.showToast(`Akun siswa "${fullName}" (${username}) berhasil ditambahkan!`, 'success');
+      persistDatabase('students', newStd.id, newStd, 'SET');
+      window.showToast(`Akun siswa "${fullName}" (Username: ${username} • Kelas: ${cleanClassName}) berhasil didaftarkan & siap login!`, 'success');
       renderActivePage();
     };
 
@@ -2189,9 +2766,9 @@
     };
 
     window.handleDeleteStudent = function(stdId) {
-      appState.db.students = appState.db.students.filter(s => s.id !== stdId);
-      persistDatabase();
-      window.showToast('Data siswa telah dihapus.', 'info');
+      appState.db.students = (appState.db.students || []).filter(s => s.id !== stdId);
+      persistDatabase('students', stdId, null, 'DELETE');
+      window.showToast('Data siswa telah dihapus & disinkronkan.', 'info');
       renderActivePage();
     };
 
@@ -2337,9 +2914,9 @@
     };
 
     window.handleDeleteAssignment = function(asgId) {
-      appState.db.assignments = appState.db.assignments.filter(a => a.id !== asgId);
-      persistDatabase();
-      window.showToast('Tugas berhasil dihapus.', 'info');
+      appState.db.assignments = (appState.db.assignments || []).filter(a => a.id !== asgId);
+      persistDatabase('assignments', asgId, null, 'DELETE');
+      window.showToast('Tugas berhasil dihapus & disinkronkan.', 'info');
       renderActivePage();
     };
 
@@ -2969,7 +3546,12 @@
         appState.db.questionPacks[packKey] = [];
       }
       appState.db.questionPacks[packKey].push(newQ);
-      persistDatabase();
+      persistDatabase('question_packs', packKey, {
+        packKey,
+        meta: getPackMetadata(subjectCode, packNumber),
+        questions: appState.db.questionPacks[packKey],
+        count: appState.db.questionPacks[packKey].length
+      }, 'SET');
       window.closeGlobalModal();
       window.showToast(`Soal Nomor ${questionNumber} berhasil ditambahkan ke ${subjectCode} Paket ${packNumber}!`, 'success');
       renderActivePage();
@@ -3047,7 +3629,12 @@
       q.correctAnswer = parseAnswerKeyInput(q.type, document.getElementById('edit-q-ans').value);
       q.explanation = document.getElementById('edit-q-exp').value.trim();
 
-      persistDatabase();
+      persistDatabase('question_packs', packKey, {
+        packKey,
+        meta: getPackMetadata(subjectCode, packNumber),
+        questions: appState.db.questionPacks[packKey],
+        count: appState.db.questionPacks[packKey].length
+      }, 'SET');
       window.closeGlobalModal();
       window.showToast(`Soal No. ${q.questionNumber} berhasil diperbarui!`, 'success');
       renderActivePage();
@@ -3057,8 +3644,13 @@
       const { subjectCode, packNumber } = appState.adminCbtFilter;
       const packKey = `${subjectCode}_P${packNumber}`;
       appState.db.questionPacks[packKey] = (appState.db.questionPacks[packKey] || []).filter(item => item.id !== qId);
-      persistDatabase();
-      window.showToast('Butir soal telah dihapus dari paket.', 'info');
+      persistDatabase('question_packs', packKey, {
+        packKey,
+        meta: getPackMetadata(subjectCode, packNumber),
+        questions: appState.db.questionPacks[packKey],
+        count: appState.db.questionPacks[packKey].length
+      }, 'SET');
+      window.showToast('Butir soal telah dihapus & disinkronkan.', 'info');
       renderActivePage();
     };
 
@@ -3637,8 +4229,15 @@
     // ----------------------------------------------------------------------------
     function renderSiswaBeranda(container) {
       const std = appState.currentUser;
+      const myClassObj = (appState.db.classes || []).find(c => isSameClass(c.className, std.className)) || {
+        className: std.className || 'Kelas Siswa',
+        homeroomTeacher: 'Guru Wali Kelas',
+        studentCountNote: 'Reguler'
+      };
+      const myClassmates = (appState.db.students || []).filter(s => isSameClass(s.className, std.className));
+      const myMaterials = (appState.db.materials || []).filter(m => isSameClass(m.className, std.className));
       const myAssignments = (appState.db.assignments || []).filter(
-        a => a.className === 'Semua Kelas' || a.className === std.className
+        a => isSameClass(a.className, std.className)
       );
       const mySubmissions = (appState.db.submissions || []).filter(s => s.studentId === std.id);
       const myExams = (appState.db.examResults || []).filter(r => r.studentId === std.id);
@@ -3669,6 +4268,35 @@
               <button type="button" onclick="window.navigateToMenu('siswa_daftar_tugas')" class="px-4 py-2.5 rounded-xl bg-white/15 hover:bg-white/25 text-white font-bold text-xs border border-white/20 transition flex items-center gap-2">
                 <i class="fa-solid fa-book-bookmark"></i>
                 <span>Lihat Daftar Tugas (${myAssignments.length})</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Kartu Ruang Kelas yang Diikuti Siswa -->
+        <div class="bento-card p-6 mb-6 border-2 border-indigo-100 bg-gradient-to-r from-white via-indigo-50/40 to-white">
+          <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div class="flex items-start gap-4">
+              <div class="w-14 h-14 rounded-2xl bg-indigo-600 text-white flex items-center justify-center text-2xl shrink-0 shadow-md">
+                <i class="fa-solid fa-chalkboard-user"></i>
+              </div>
+              <div>
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[11px] font-extrabold">KELAS AKTIF ANDA</span>
+                  <span class="text-xs font-bold text-slate-500">Program: ${escapeHtml(myClassObj.studentCountNote || 'Reguler')}</span>
+                </div>
+                <h3 class="text-lg md:text-xl font-extrabold text-slate-900 mt-1">${escapeHtml(myClassObj.className)}</h3>
+                <p class="text-xs text-slate-600 mt-0.5">
+                  <i class="fa-solid fa-user-tie text-indigo-600 mr-1"></i>Wali Kelas / Pengampu: <strong>${escapeHtml(myClassObj.homeroomTeacher || 'Guru Kelas')}</strong>
+                  <span class="mx-2">•</span>
+                  <i class="fa-solid fa-users text-sky-600 mr-1"></i><strong>${myClassmates.length}</strong> Siswa Terdaftar di Kelas Ini
+                </p>
+              </div>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <button type="button" onclick="window.navigateToMenu('siswa_kelas_materi')" class="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs shadow-sm transition flex items-center gap-2">
+                <i class="fa-solid fa-door-open"></i>
+                <span>Buka Ruang Kelas & Materi (${myMaterials.length})</span>
               </button>
             </div>
           </div>
@@ -3737,6 +4365,131 @@
       };
       window.navigateToMenu('siswa_cbt');
     };
+
+    // ----------------------------------------------------------------------------
+    // MENU SISWA BARU: RUANG KELAS & MATERI PEMBELAJARAN (SESUAI KELAS SISWA)
+    // ----------------------------------------------------------------------------
+    function renderSiswaKelasMateri(container) {
+      const std = appState.currentUser;
+      const myClassObj = (appState.db.classes || []).find(c => isSameClass(c.className, std.className)) || {
+        className: std.className || 'Kelas Siswa',
+        homeroomTeacher: 'Guru Kelas',
+        studentCountNote: 'Reguler'
+      };
+      const myClassmates = (appState.db.students || []).filter(s => isSameClass(s.className, std.className));
+      const myMaterials = (appState.db.materials || []).filter(m => isSameClass(m.className, std.className));
+      const myAssignments = (appState.db.assignments || []).filter(a => isSameClass(a.className, std.className));
+      const subjects = appState.db.subjects || SUBJECTS_MASTER;
+
+      container.innerHTML = `
+        <!-- Header Informasi Kelas Siswa -->
+        <div class="bento-card p-6 mb-6 bg-gradient-to-r from-indigo-900 via-indigo-800 to-slate-900 text-white">
+          <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div>
+              <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/15 text-xs font-bold text-emerald-300 mb-2">
+                <i class="fa-solid fa-chalkboard"></i> RUANG KELAS TERINTEGRASI
+              </span>
+              <h2 class="text-xl md:text-2xl font-extrabold">${escapeHtml(myClassObj.className)}</h2>
+              <p class="text-xs text-indigo-200 mt-1">
+                Wali Kelas: <strong>${escapeHtml(myClassObj.homeroomTeacher)}</strong> • Program: ${escapeHtml(myClassObj.studentCountNote || 'Reguler')} • Anggota Kelas: ${myClassmates.length} Siswa
+              </p>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <button type="button" onclick="window.navigateToMenu('siswa_daftar_tugas')" class="px-4 py-2.5 rounded-xl bg-white/15 hover:bg-white/25 text-white text-xs font-bold border border-white/20 transition">
+                <i class="fa-solid fa-list-check mr-1"></i> Tugas Kelas (${myAssignments.length})
+              </button>
+              <button type="button" onclick="window.navigateToMenu('siswa_cbt')" class="px-4 py-2.5 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-extrabold transition">
+                <i class="fa-solid fa-laptop-file mr-1"></i> Latihan Soal & Kuis
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          <!-- Kolom Kiri: Materi & Modul Pembelajaran Kelas -->
+          <div class="lg:col-span-8 space-y-5">
+            <div class="bento-card p-6">
+              <h3 class="text-base font-extrabold text-slate-900 mb-1 flex items-center gap-2">
+                <i class="fa-solid fa-book-open-reader text-indigo-600"></i>
+                <span>Materi, Bacaan & Video Pembelajaran (${escapeHtml(myClassObj.className)})</span>
+              </h3>
+              <p class="text-xs text-slate-500 mb-4">Materi yang diunggah guru untuk kelas Anda serta ringkasan materi 9 mata pelajaran kurikulum.</p>
+
+              ${myMaterials.length > 0 ? `
+                <div class="space-y-3.5 mb-6">
+                  ${myMaterials.map(mat => `
+                    <div class="p-4 rounded-2xl border border-indigo-200 bg-indigo-50/40">
+                      <div class="flex flex-wrap items-center justify-between gap-2 mb-1.5">
+                        <div class="flex items-center gap-2">
+                          <span class="px-2.5 py-0.5 rounded-lg bg-indigo-600 text-white text-[11px] font-bold">${escapeHtml(mat.subjectName)}</span>
+                          <span class="px-2.5 py-0.5 rounded-lg bg-white border border-slate-200 text-slate-700 text-[11px] font-semibold">${escapeHtml(mat.className)}</span>
+                        </div>
+                        <span class="text-[11px] text-slate-500"><i class="fa-regular fa-clock mr-1"></i>${escapeHtml(mat.createdAt || '')}</span>
+                      </div>
+                      <h4 class="text-sm font-extrabold text-slate-900">${escapeHtml(mat.title)}</h4>
+                      <p class="text-xs text-slate-700 mt-1.5 whitespace-pre-line leading-relaxed">${escapeHtml(mat.summary)}</p>
+                      ${mat.mediaUrl ? `
+                        <div class="mt-3 pt-2.5 border-t border-indigo-100">
+                          <a href="${escapeHtml(mat.mediaUrl)}" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold transition">
+                            <i class="fa-solid fa-circle-play"></i> Buka Video / Dokumen Materi
+                          </a>
+                        </div>
+                      ` : ''}
+                    </div>
+                  `).join('')}
+                </div>
+              ` : ''}
+
+              <h4 class="text-xs font-extrabold uppercase tracking-wider text-slate-500 mb-3">Modul Ringkas Kurikulum (${subjects.length} Mata Pelajaran):</h4>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                ${subjects.map(sub => `
+                  <div class="p-4 rounded-2xl border border-slate-200 hover:border-indigo-300 bg-slate-50/60 flex flex-col justify-between gap-3">
+                    <div>
+                      <div class="flex items-center gap-2.5 mb-2">
+                        <div class="w-9 h-9 rounded-xl ${sub.iconBg || 'bg-indigo-600'} text-white flex items-center justify-center text-xs shrink-0">
+                          <i class="fa-solid ${sub.icon || 'fa-book'}"></i>
+                        </div>
+                        <div>
+                          <h5 class="text-sm font-extrabold text-slate-900">${escapeHtml(sub.name)}</h5>
+                          <span class="text-[10px] font-mono text-indigo-600">Kode: ${escapeHtml(sub.code)}</span>
+                        </div>
+                      </div>
+                      <p class="text-xs text-slate-600 leading-relaxed"><strong>Pokok Bahasan:</strong> ${escapeHtml(sub.topics || '-')}</p>
+                    </div>
+                    <button type="button" onclick="window.QuickStartSubjectFromHome('${sub.code}')" class="w-full py-2 px-3 rounded-xl bg-white hover:bg-indigo-50 text-indigo-700 border border-indigo-200 font-bold text-xs transition flex items-center justify-center gap-1.5">
+                      <i class="fa-solid fa-play"></i> Kerjakan Latihan Soal ${escapeHtml(sub.name)}
+                    </button>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          </div>
+
+          <!-- Kolom Kanan: Daftar Teman Sekelas & Tugas Kelas -->
+          <div class="lg:col-span-4 space-y-5">
+            <div class="bento-card p-6">
+              <h3 class="text-sm font-extrabold text-slate-900 mb-3 flex items-center gap-2">
+                <i class="fa-solid fa-users text-emerald-600"></i>
+                <span>Anggota ${escapeHtml(myClassObj.className)} (${myClassmates.length})</span>
+              </h3>
+              <div class="space-y-2 max-h-64 overflow-y-auto pr-1">
+                ${myClassmates.map(m => `
+                  <div class="flex items-center gap-3 p-2.5 rounded-xl ${m.id === std.id ? 'bg-indigo-50 border border-indigo-200' : 'bg-slate-50 border border-slate-200/70'}">
+                    <div class="w-8 h-8 rounded-full bg-indigo-600 text-white font-bold text-xs flex items-center justify-center shrink-0">
+                      ${escapeHtml((m.fullName || 'S').charAt(0).toUpperCase())}
+                    </div>
+                    <div class="min-w-0 flex-1">
+                      <p class="text-xs font-bold text-slate-900 truncate">${escapeHtml(m.fullName)} ${m.id === std.id ? '<span class="text-[10px] text-indigo-600">(Anda)</span>' : ''}</p>
+                      <p class="text-[10px] text-slate-500">NISN: ${escapeHtml(m.nisn || '-')}</p>
+                    </div>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
 
     // ----------------------------------------------------------------------------
     // MENU SISWA 2: BIODATA SISWA
@@ -4309,13 +5062,39 @@
           appState.studentCbtSession.step = 'EXAM';
           appState.studentCbtSession.currentIndex = 0;
           appState.studentCbtSession.answers = {};
+          try {
+            const draftKey = `${CBT_PROGRESS_PREFIX}${appState.currentUser.id}_${appState.studentCbtSession.subjectCode}_P${appState.studentCbtSession.packNumber}`;
+            const savedDraft = localStorage.getItem(draftKey);
+            if (savedDraft) {
+              const parsed = JSON.parse(savedDraft);
+              if (parsed && parsed.answers && Object.keys(parsed.answers).length > 0) {
+                appState.studentCbtSession.answers = parsed.answers;
+                appState.studentCbtSession.currentIndex = Number(parsed.currentIndex) || 0;
+                window.showToast('Progres jawaban Anda sebelumnya berhasil dipulihkan otomatis!', 'info');
+              }
+            }
+          } catch (e) {}
           renderActivePage();
         }
       }, 750);
     };
 
+    function autoSaveStudentCbtDraft() {
+      try {
+        if (!appState.currentUser || !appState.studentCbtSession.subjectCode) return;
+        const draftKey = `${CBT_PROGRESS_PREFIX}${appState.currentUser.id}_${appState.studentCbtSession.subjectCode}_P${appState.studentCbtSession.packNumber}`;
+        localStorage.setItem(draftKey, JSON.stringify({
+          answers: appState.studentCbtSession.answers,
+          currentIndex: appState.studentCbtSession.currentIndex,
+          savedAt: Date.now()
+        }));
+        updateSaveStatusBadge('SAVED', 'Jawaban Tersimpan Otomatis');
+      } catch (e) {}
+    }
+
     window.studentAnswerPG = function(qNum, optIdx) {
       appState.studentCbtSession.answers[qNum] = Number(optIdx);
+      autoSaveStudentCbtDraft();
       renderActivePage();
     };
 
@@ -4328,11 +5107,13 @@
         arr = [...arr, optIdx].sort((a, b) => a - b);
       }
       appState.studentCbtSession.answers[qNum] = arr;
+      autoSaveStudentCbtDraft();
       renderActivePage();
     };
 
     window.studentAnswerBS = function(qNum, val) {
       appState.studentCbtSession.answers[qNum] = val;
+      autoSaveStudentCbtDraft();
       renderActivePage();
     };
 
@@ -4440,7 +5221,11 @@
       };
 
       appState.db.examResults.unshift(resultRecord);
-      persistDatabase('exam_results', resultRecord.id, resultRecord);
+      persistDatabase('exam_results', resultRecord.id, resultRecord, 'SET');
+      try {
+        const draftKey = `${CBT_PROGRESS_PREFIX}${appState.currentUser.id}_${sess.subjectCode}_P${sess.packNumber}`;
+        localStorage.removeItem(draftKey);
+      } catch (e) {}
 
       sess.lastResult = resultRecord;
       sess.step = 'RESULT';
@@ -4454,7 +5239,7 @@
     function renderSiswaDaftarTugas(container) {
       const std = appState.currentUser;
       const assignments = (appState.db.assignments || []).filter(
-        a => a.className === 'Semua Kelas' || a.className === std.className
+        a => isSameClass(a.className, std.className)
       );
       const mySubmissions = (appState.db.submissions || []).filter(s => s.studentId === std.id);
 
@@ -4467,6 +5252,13 @@
             </div>
           </div>
 
+          ${assignments.length === 0 ? `
+            <div class="p-8 rounded-2xl bg-slate-50 border border-slate-200 text-center">
+              <i class="fa-solid fa-clipboard-check text-3xl text-slate-400 mb-2"></i>
+              <p class="text-sm font-bold text-slate-700">Belum Ada Tugas Baru untuk ${escapeHtml(std.className)}</p>
+              <p class="text-xs text-slate-500 mt-1">Tugas yang diterbitkan oleh Guru untuk kelas Anda akan otomatis tampil di halaman ini.</p>
+            </div>
+          ` : `
           <div class="space-y-4">
             ${assignments.map(asg => {
               const submitted = mySubmissions.find(s => s.assignmentId === asg.id);
@@ -4505,6 +5297,7 @@
               `;
             }).join('')}
           </div>
+          `}
         </div>
       `;
     }
@@ -4520,7 +5313,7 @@
     function renderSiswaKumpulTugas(container) {
       const std = appState.currentUser;
       const assignments = (appState.db.assignments || []).filter(
-        a => a.className === 'Semua Kelas' || a.className === std.className
+        a => isSameClass(a.className, std.className)
       );
       const selectedId = appState.selectedAssignmentForUpload || (assignments[0] && assignments[0].id) || '';
 
